@@ -74,8 +74,8 @@ class TrainingConfig:
     loss_fn: str = "infonce"
 
     # Training hyperparameters
-    epochs: int = 2
-    batch_size: int = 8
+    epochs: int = 50
+    batch_size: int = 32
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
     warmup_ratio: float = 0.1
@@ -274,20 +274,30 @@ class ParquetTokenDataset(Dataset):
     - remaps Tahoe token_ids -> scGPT vocab ids (including special tokens)
     - ensures exactly one <cls> at position 0 and expr[0]=pad_value
     - optional target masking (label -> target token id)
+
+    ⚠️ NOTE on caching:
+    - Caching the *whole* parquet table can explode memory when shards are large,
+      especially with multi-worker DataLoader (each worker has its own cache).
+    - Default is row-group caching (small, sequential-friendly) instead of whole-table caching.
     """
 
     def __init__(
         self,
         parquet_paths: Sequence[str],
         cls_token_id: int,
-        pad_value: float=0.0,
-        pad_token_id: int=0,
+        pad_value: float = 0.0,
+        pad_token_id: int = 0,
         eoc_token_id: Optional[int] = None,
         tahoe2scgpt_json: str = "tahoe/tahoe_tokenid_to_scgptid.json",
         # label -> target_gene_symbol -> scGPT_id
         label2target_scgptid: Optional[Dict[int, int]] = None,
         mask_value: float = 0.0,
-        cache_tables: bool = True,
+        # Backward-compat: cache_tables used to cache the *entire* file table. Default now False.
+        cache_tables: bool = False,
+        # New: cache last row-group instead (much smaller than entire table)
+        cache_row_groups: bool = True,
+        # Optional: pre-read row group into memory-mapped buffers (may help HDD/network FS)
+        use_memory_map: bool = False,
     ):
         self.paths = sorted(parquet_paths)
         self.cls_token_id = int(cls_token_id)
@@ -303,7 +313,7 @@ class ParquetTokenDataset(Dataset):
             self.tahoe_gene_map = {int(k): int(v) for k, v in json.load(f).items()}
 
         # Tahoe special tokens are almost certainly: <pad>=0, <cls>=1, <eoc>=2
-        # We must map them to *scGPT* special ids from vocab/config. 
+        # We must map them to *scGPT* special ids from vocab/config.
         self.tahoe_special_map = {
             0: self.pad_token_id,
             1: self.cls_token_id,
@@ -311,24 +321,49 @@ class ParquetTokenDataset(Dataset):
         if self.eoc_token_id is not None:
             self.tahoe_special_map[2] = self.eoc_token_id
 
-        # build lightweight (path, row_idx) index
-        # __init__ 里：替换掉 self._index 那段
-        self.row_counts = []
+        # ----------------------------
+        # Build lightweight index:
+        # global idx -> (file_k, row_group_j, row_in_group)
+        # ----------------------------
+        self._pfs: List[pq.ParquetFile] = []
+        self._file_rg_offsets: List[List[int]] = []   # per file: prefix rows per row-group, length = n_rg+1
+        self._file_num_rows: List[int] = []
+
+        total = 0
+        self.prefix = [0]  # global prefix by file
         for p in self.paths:
-            pf = pq.ParquetFile(p)
-            self.row_counts.append(pf.metadata.num_rows)
+            pf = pq.ParquetFile(p, memory_map=use_memory_map)
+            self._pfs.append(pf)
 
-        self.prefix = [0]
-        s = 0
-        for n in self.row_counts:
-            s += n
-            self.prefix.append(s)
-        # 删掉 self._index 相关
+            nrg = pf.num_row_groups
+            rg_offsets = [0]
+            s = 0
+            # metadata is cheap to read and avoids loading any data buffers
+            for j in range(nrg):
+                n = pf.metadata.row_group(j).num_rows
+                s += n
+                rg_offsets.append(s)
 
-        # simple per-file cache (whole table) — ok if shards are not huge
+            self._file_rg_offsets.append(rg_offsets)
+            self._file_num_rows.append(s)
+
+            total += s
+            self.prefix.append(total)
+
+        # ----------------------------
+        # Cache policy
+        # ----------------------------
         self.cache_tables = bool(cache_tables)
+        self.cache_row_groups = bool(cache_row_groups) and (not self.cache_tables)
+
         self._cached_path = None
         self._cached_table = None
+
+        self._cached_rg_key = None  # (path, rg_idx)
+        self._cached_rg_table = None
+
+        # columns we need
+        self._cols = ["genes", "expressions", "label"]
 
     def __len__(self):
         return self.prefix[-1]
@@ -366,7 +401,7 @@ class ParquetTokenDataset(Dataset):
     def _ensure_single_cls(self, genes: np.ndarray, exprs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """
         Ensure exactly one <cls> at pos 0 and expr[0]=pad_value.
-        scGPT takes CLS embedding from token 0. 
+        scGPT takes CLS embedding from token 0.
         """
         if genes.size == 0:
             return genes, exprs
@@ -394,7 +429,7 @@ class ParquetTokenDataset(Dataset):
     def _mask_target(self, genes: np.ndarray, exprs: np.ndarray, label: int) -> np.ndarray:
         """
         Mask expression for target gene token to prevent leakage (anti-cheat).
-        Official code masks perturbed genes in AnnData; we do token-level analogue. 
+        Official code masks perturbed genes in AnnData; we do token-level analogue.
         """
         target_id = self.label2target_scgptid.get(int(label))
         if target_id is None:
@@ -407,22 +442,59 @@ class ParquetTokenDataset(Dataset):
             exprs[j] = self.mask_value
         return exprs
 
-    def __getitem__(self, idx):
+    def _locate(self, idx: int) -> tuple[int, int, int]:
+        """
+        Map global idx -> (file_k, row_group_j, row_in_group).
+        """
         k = bisect.bisect_right(self.prefix, idx) - 1
-        path = self.paths[k]
-        row_i = idx - self.prefix[k]
+        in_file = idx - self.prefix[k]
 
-        if (not self.cache_tables) or (path != self._cached_path):
-            table = pq.read_table(path, columns=["genes", "expressions", "label"])
-            if self.cache_tables:
+        rg_offsets = self._file_rg_offsets[k]
+        rg = bisect.bisect_right(rg_offsets, in_file) - 1
+        row_in_rg = in_file - rg_offsets[rg]
+        return k, rg, row_in_rg
+
+    def _read_row_group_table(self, file_k: int, rg: int):
+        pf = self._pfs[file_k]
+        return pf.read_row_group(rg, columns=self._cols)
+
+    def __getitem__(self, idx):
+        file_k, rg, row_in_rg = self._locate(idx)
+        path = self.paths[file_k]
+
+        # 1) whole-table cache (NOT recommended for large shards)
+        if self.cache_tables:
+            if path != self._cached_path:
+                table = pq.read_table(path, columns=self._cols)
                 self._cached_table = table
                 self._cached_path = path
-        else:
-            table = self._cached_table
+            else:
+                table = self._cached_table
 
-        genes = table["genes"][row_i].as_py()
-        exprs = table["expressions"][row_i].as_py()
-        label = int(table["label"][row_i].as_py())
+            genes = table["genes"][idx - self.prefix[file_k]].as_py()
+            exprs = table["expressions"][idx - self.prefix[file_k]].as_py()
+            label = int(table["label"][idx - self.prefix[file_k]].as_py())
+
+        # 2) row-group cache (recommended default)
+        elif self.cache_row_groups:
+            key = (path, int(rg))
+            if key != self._cached_rg_key:
+                rg_table = self._read_row_group_table(file_k, rg)
+                self._cached_rg_table = rg_table
+                self._cached_rg_key = key
+            else:
+                rg_table = self._cached_rg_table
+
+            genes = rg_table["genes"][row_in_rg].as_py()
+            exprs = rg_table["expressions"][row_in_rg].as_py()
+            label = int(rg_table["label"][row_in_rg].as_py())
+
+        # 3) no cache: read exactly one row-group, use one row, then drop
+        else:
+            rg_table = self._read_row_group_table(file_k, rg)
+            genes = rg_table["genes"][row_in_rg].as_py()
+            exprs = rg_table["expressions"][row_in_rg].as_py()
+            label = int(rg_table["label"][row_in_rg].as_py())
 
         genes = np.asarray(genes, dtype=np.int64)
         exprs = np.asarray(exprs, dtype=np.float32)
@@ -446,6 +518,7 @@ class ParquetTokenDataset(Dataset):
             "expressions": torch.from_numpy(exprs).float(),
             "label": torch.tensor(label, dtype=torch.long),
         }
+
 
 class CellTokenDataset(Dataset):
     """Dataset that returns tokenized genes/expressions with labels."""
@@ -872,7 +945,7 @@ class ScGPTTrainer:
 
 
         from tqdm import tqdm
-        self.config.epochs = 2
+
         for epoch in range(self.config.epochs):
             if hasattr(train_loader.sampler, "set_epoch"):
                 train_loader.sampler.set_epoch(epoch)
@@ -1400,7 +1473,6 @@ def main():
         train_sampler = torch.utils.data.DistributedSampler(train_subset, shuffle=False)
         val_sampler = torch.utils.data.DistributedSampler(val_subset, shuffle=False)
 
-    config.batch_size=8
     loader_kwargs = dict(
         num_workers=4,              # 先 4；CPU 多可试 8
         pin_memory=True,
