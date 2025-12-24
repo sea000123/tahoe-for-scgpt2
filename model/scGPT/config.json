@@ -1,0 +1,22 @@
+{
+  "architectures": [
+    "ScGPTModel"
+  ],
+  "cell_emb_style": "cls",
+  "d_hid": 512,
+  "dropout": 0.0,
+  "embsize": 512,
+  "explicit_zero_prob": false,
+  "input_emb_style": "continuous",
+  "max_seq_len": 1536,
+  "model_type": "scgpt",
+  "nhead": 8,
+  "nlayers": 12,
+  "norm_scheme": "post",
+  "pad_token_id": 0,
+  "torch_dtype": "float32",
+  "transformers_version": "4.43.4",
+  "use_fast_transformer": true,
+  "use_flash_attention": false,
+  "vocab_size": 60697
+}

@@ -1,0 +1,84 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Data files
+*.h5ad
+data/raw/*.csv
+*.zip
+
+# Conda
+.conda/
+.condarc
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+tmp/
+temp/
+
+# Model checkpoints
+*.pt
+*.pth
+*.safetensors
+
+# Test Results
+tests/integration/results/
+
+# Data (root level only, not src/data/)
+/data/
+
+# External
+docs/references
+hpdex/
+cell-eval/
+csc286_eval.py
+/logs/
+# secrets / env
+.env
+*.env
+**/.env
+**/*token*
+**/*secret*
+**/*key*
+**/*credential*
+# python cache
+__pycache__/
+*.pyc
+# large docs
+docs/references/*.pdf
