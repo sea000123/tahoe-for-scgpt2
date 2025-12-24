@@ -11,11 +11,14 @@ from tqdm import tqdm
 # ----------------------------
 # Config
 # ----------------------------
-LOCAL_TAHOE_DIR = "./tahoe_small_download"
+LOCAL_TAHOE_DIR = "../../Tahoe/raw/tahoe_small_download"
 DATA_GLOB = os.path.join(LOCAL_TAHOE_DIR, "data", "train-*.parquet")
 
 OUT_DIR = "./tahoe_scgpt_single_target_log1p"
 os.makedirs(OUT_DIR, exist_ok=True)
+
+# Tahoe token_id -> scGPT vocab id mapping (precompute in build to speed up training)
+TAHOE2SCGPT_JSON = "tahoe_tokenid_to_scgptid.json"
 
 RANDOM_SEED = 286
 OOD_CELL_LINE_FRAC = 0.1  # 1/10 cell lines held out for OOD generalization
@@ -82,6 +85,32 @@ def stable_u01(s: str) -> float:
     v = int(h[:16], 16)
     return (v % 10_000_000) / 10_000_000.0
 
+# ----------------------------
+# Tahoe -> scGPT gene-id remap (vectorized)
+# ----------------------------
+if not os.path.isfile(TAHOE2SCGPT_JSON):
+    raise FileNotFoundError(
+        f"Mapping json not found: {TAHOE2SCGPT_JSON}. "
+        "Please generate/download it (Tahoe token_id -> scGPT vocab id)."
+    )
+
+with open(TAHOE2SCGPT_JSON, "r", encoding="utf-8") as f:
+    _t2s_raw = json.load(f)
+# keys/vals as sorted numpy arrays for fast mapping via searchsorted
+_SCGPT_KEYS = np.asarray(sorted(int(k) for k in _t2s_raw.keys()), dtype=np.int64)
+_SCGPT_VALS = np.asarray([int(_t2s_raw[str(k)]) if str(k) in _t2s_raw else int(_t2s_raw[k]) for k in _SCGPT_KEYS.tolist()], dtype=np.int64)
+
+def tahoe_to_scgpt_ids(g):
+    g = np.asarray(g, dtype=np.int64)
+    idx = np.searchsorted(_SCGPT_KEYS, g)
+    # 先做一个合法索引版本，避免 idx == size 越界
+    idx_safe = np.minimum(idx, _SCGPT_KEYS.size - 1)
+    # keep 先判断是否在范围内，再用 idx_safe 做比较（不会越界）
+    keep = (idx < _SCGPT_KEYS.size) & (_SCGPT_KEYS[idx_safe] == g)
+    g_mapped = _SCGPT_VALS[idx_safe]
+    return g_mapped, keep
+
+
 def clean_log1p_topk(genes, exprs, topk=TOP_K_GENES):
     """
     - drop marker token at position 0
@@ -100,6 +129,13 @@ def clean_log1p_topk(genes, exprs, topk=TOP_K_GENES):
 
     g = np.asarray(genes, dtype=np.int64)
     x = np.asarray(exprs, dtype=np.float32)
+
+    # remap Tahoe gene token_ids -> scGPT vocab ids (drop unknown ids)
+    g_mapped, keep = tahoe_to_scgpt_ids(g)
+    if g_mapped.size == 0:
+        return [], []
+    x = x[keep]
+    g = g_mapped[keep]
 
     # important: avoid NaN from negative values
     x = np.maximum(x, 0.0)
@@ -135,6 +171,10 @@ print(f"[Info] Classes(target genes) kept: {len(gene2label)}")
 
 with open(os.path.join(OUT_DIR, "label_vocab.json"), "w", encoding="utf-8") as f:
     json.dump({"gene2label": gene2label, "label2gene": label2gene}, f, ensure_ascii=False, indent=2)
+
+# mark that genes in parquet shards are already scGPT vocab ids
+with open(os.path.join(OUT_DIR, "id_space.json"), "w", encoding="utf-8") as f:
+    json.dump({"genes": "scgpt"}, f, ensure_ascii=False, indent=2)
 
 # ----------------------------
 # 1) Collect cell_line_ids (Pass1)

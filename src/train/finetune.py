@@ -152,6 +152,7 @@ class ParquetTokenDataset(Dataset):
         pad_token_id: int = 0,
         eoc_token_id: Optional[int] = None,
         tahoe2scgpt_json: str = "tahoe/tahoe_tokenid_to_scgptid.json",
+        remap_tahoe_to_scgpt: bool = True,
         label2target_scgptid: Optional[Dict[int, int]] = None,
         mask_value: float = 0.0,
         cache_tables: bool = False,
@@ -167,16 +168,24 @@ class ParquetTokenDataset(Dataset):
         self.label2target_scgptid = label2target_scgptid or {}
         self.mask_value = float(mask_value)
 
-        with open(tahoe2scgpt_json, "r", encoding="utf-8") as f:
-            self.tahoe_gene_map = {int(k): int(v) for k, v in json.load(f).items()}
-
+        self.remap_tahoe_to_scgpt = bool(remap_tahoe_to_scgpt)
+        if self.remap_tahoe_to_scgpt:
+            with open(tahoe2scgpt_json, "r", encoding="utf-8") as f:
+                self.tahoe_gene_map = {int(k): int(v) for k, v in json.load(f).items()}
+        else:
+            # genes in parquet are already scGPT vocab ids
+            self.tahoe_gene_map = {}
         # Tahoe special tokens are typically: <pad>=0, <cls>=1, <eoc>=2
-        self.tahoe_special_map = {
-            0: self.pad_token_id,
-            1: self.cls_token_id,
-        }
-        if self.eoc_token_id is not None:
-            self.tahoe_special_map[2] = self.eoc_token_id
+        # Only needed when we are remapping Tahoe ids -> scGPT ids at training time.
+        if self.remap_tahoe_to_scgpt:
+            self.tahoe_special_map = {
+                0: self.pad_token_id,
+                1: self.cls_token_id,
+            }
+            if self.eoc_token_id is not None:
+                self.tahoe_special_map[2] = self.eoc_token_id
+        else:
+            self.tahoe_special_map = {}
 
         # Lightweight index: global idx -> (file_k, row_group_j, row_in_group)
         self._pfs: List[pq.ParquetFile] = []
@@ -218,6 +227,8 @@ class ParquetTokenDataset(Dataset):
         return self.prefix[-1]
 
     def _remap_tokens(self, genes: np.ndarray, exprs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        if not self.remap_tahoe_to_scgpt:
+            return genes.astype(np.int64, copy=False), exprs.astype(np.float32, copy=False)
         out_g, out_x = [], []
         for g, x in zip(genes.tolist(), exprs.tolist()):
             g = int(g)
@@ -858,6 +869,21 @@ def main():
     if is_master:
         print(f"Using Tahoe parquet dataset: {parquet_dir}")
 
+    # Detect whether parquet 'genes' are already scGPT vocab ids (pre-remapped in build_dataset.py)
+    genes_already_scgpt = False
+    id_space_path = os.path.join(parquet_dir, "id_space.json")
+    if os.path.isfile(id_space_path):
+        try:
+            with open(id_space_path, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+            genes_already_scgpt = (str(obj.get("genes", "")).lower() == "scgpt")
+        except Exception as e:
+            if is_master:
+                print(f"[Warn] Failed to parse {id_space_path}: {e}. Will remap Tahoe->scGPT in dataloader.")
+            genes_already_scgpt = False
+    if is_master:
+        print(f"[Info] genes_already_scgpt = {genes_already_scgpt}")
+
     # 1) label vocab -> num_conditions, label2gene
     vocab_path = os.path.join(parquet_dir, "label_vocab.json")
     with open(vocab_path, "r", encoding="utf-8") as f:
@@ -915,6 +941,7 @@ def main():
         pad_value=pad_value,
         pad_token_id=pad_token_id,
         tahoe2scgpt_json=config.tahoe2scgpt_json,
+        remap_tahoe_to_scgpt=(not genes_already_scgpt),
         label2target_scgptid=label2target_scgptid,
         mask_value=0.0,
     )
@@ -924,6 +951,7 @@ def main():
         pad_value=pad_value,
         pad_token_id=pad_token_id,
         tahoe2scgpt_json=config.tahoe2scgpt_json,
+        remap_tahoe_to_scgpt=(not genes_already_scgpt),
         label2target_scgptid=label2target_scgptid,
         mask_value=0.0,
     )
@@ -933,6 +961,7 @@ def main():
         pad_value=pad_value,
         pad_token_id=pad_token_id,
         tahoe2scgpt_json=config.tahoe2scgpt_json,
+        remap_tahoe_to_scgpt=(not genes_already_scgpt),
         label2target_scgptid=label2target_scgptid,
         mask_value=0.0,
     )
