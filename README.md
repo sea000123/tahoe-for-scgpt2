@@ -52,6 +52,19 @@ python -m src.train.finetune \
   --parquet_dir /home/user/Desktop/CODE/VCC/Tahoe/raw/tahoe_scgpt_single_target_log1p
 
 python -m src.train.finetune \
+  --mode head_only \
+  --loss classification \
+  --parquet_dir ./tahoe/tahoe_scgpt_single_target_log1p \
+  --epochs 10 \
+  --batch_size 64 \
+  --learning_rate 3e-4 \
+  --weight_decay 0.01 \
+  --warmup_ratio 0.1 \
+  --early_stopping_patience 5 \
+  --scgpt_model_dir model/scGPT \
+  --tahoe2scgpt_json ./tahoe/tahoe_tokenid_to_scgptid.json
+
+python -m src.train.finetune \
   --mode lora_head --loss classification \
   --parquet_dir /tahoe/tahoe_scgpt_single_target_log1p
 
@@ -60,7 +73,7 @@ python -m src.train.finetune \
   --parquet_dir /home/user/Desktop/CODE/VCC/Tahoe/raw/tahoe_scgpt_single_target_log1p \
   --finetune_checkpoint './model/scgpt_finetune/final_head_only.pt'
 
-```# tahoe-for-scgpt
+```
 
 [Eval] test acc: 0.0475
-[Eval] ood  acc: 0.0447
+[Eval] ood test acc: 0.0447
