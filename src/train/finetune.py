@@ -22,10 +22,18 @@ import bisect
 import glob
 import json
 import os
+import time
+from tqdm import tqdm
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
+from datetime import datetime
+from collections import defaultdict
 
+# reuse uploaded eval utilities
+from src.evaluate.metrics import compute_all_metrics  # :contentReference[oaicite:8]{index=8}
+from src.evaluate.confidence import ConfidenceScorer, coverage_accuracy_curve, compute_auc_coverage_accuracy  # :contentReference[oaicite:9]{index=9}
+from src.evaluate.error_analysis import generate_error_report  # :contentReference[oaicite:10]{index=10}
 import numpy as np
 import pyarrow.parquet as pq
 import torch
@@ -128,6 +136,23 @@ class RetrievalHead(nn.Module):
         if self.normalize:
             x = F.normalize(x, p=2, dim=-1)
         return x
+
+class EmbeddingDataset(Dataset):
+    def __init__(self, z_path: Path, y_path: Path):
+        self.z = np.load(z_path)  # [N, D]
+        self.y = np.load(y_path)  # [N]
+    def __len__(self):
+        return self.y.shape[0]
+    def __getitem__(self, idx):
+        return {
+            "z": torch.from_numpy(self.z[idx]).float(),
+            "label": torch.tensor(int(self.y[idx]), dtype=torch.long),
+        }
+
+def emb_collate(batch):
+    z = torch.stack([b["z"] for b in batch], dim=0)
+    y = torch.stack([b["label"] for b in batch], dim=0)
+    return {"z": z, "labels": y}
 
 
 class ParquetTokenDataset(Dataset):
@@ -359,6 +384,57 @@ def _make_scgpt_collate_fn(collator):
 
     return collate
 
+@torch.no_grad()
+def build_embedding_cache(
+    *,
+    model,
+    device: str,
+    pad_token_id: int,
+    dataset: torch.utils.data.Dataset,
+    collate_fn,
+    split_name: str,
+    out_dir: Path,
+    batch_size: int,
+):
+    """
+    Save:
+    - z: projected embedding after retrieval_head  [N, D]
+    - y: labels                                  [N]
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    z_path = out_dir / f"{split_name}_z.npy"
+    y_path = out_dir / f"{split_name}_y.npy"
+
+    if z_path.exists() and y_path.exists():
+        print(f"[Cache] Found existing cache: {z_path} / {y_path}")
+        return z_path, y_path
+
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn, num_workers=4, pin_memory=True)
+    base = model.module if hasattr(model, "module") else model
+    base.eval()
+
+    zs, ys = [], []
+    for i, batch in enumerate(tqdm(loader, desc=f"[Cache:{split_name}]", total=len(loader))):
+        gene = batch["gene"].to(device, non_blocking=True)
+        expr = batch["expr"].to(device, non_blocking=True)
+        labels = batch["labels"].cpu().long()
+
+        cls = base.encode_tokens(gene, expr, pad_token_id=pad_token_id, normalize=False)
+        z = base.retrieval_head(cls)
+        z = F.normalize(z, p=2, dim=-1).detach().cpu().float()
+
+        zs.append(z)
+        ys.append(labels)
+        if i % 200 == 0:
+            print(f"[Cache:{split_name}] step={i}/{len(loader)}")
+
+    z_all = torch.cat(zs, dim=0).numpy()
+    y_all = torch.cat(ys, dim=0).numpy()
+
+    np.save(z_path, z_all)
+    np.save(y_path, y_all)
+    print(f"[Cache] Saved: {z_path} shape={z_all.shape}, {y_path} shape={y_all.shape}")
+    return z_path, y_path
 
 class FineTunableScGPTEncoder(nn.Module):
     """scGPT encoder wrapper + retrieval head + (optional) LoRA adapters."""
@@ -507,38 +583,106 @@ class ScGPTTrainer:
         num_batches = 0
         base_model = self.model.module if hasattr(self.model, "module") else self.model
 
-        for batch in dataloader:
-            input_gene_ids = batch["gene"].to(self.device)
-            expressions = batch["expr"].to(self.device)
-            labels = batch["labels"].to(self.device)
+        # ---- timing accumulators ----
+        t_data = 0.0
+        t_fwd = 0.0
+        t_bwd = 0.0
 
-            if base_model.config.mode in ["head_only", "frozen"]:
-                with torch.no_grad():
+        # for dataloader timing: time between iterations
+        prev_end = time.perf_counter()
+
+        for step, batch in enumerate(dataloader):
+            if getattr(self.config, "max_steps", 0) and step + 1 >= self.config.max_steps:
+                break
+
+            # ---- data time: time waiting for the next batch ----
+            now = time.perf_counter()
+            t_data += (now - prev_end)
+            if "z" in batch:
+                z = batch["z"].to(self.device, non_blocking=True)
+                labels = batch["labels"].to(self.device, non_blocking=True)
+                t0 = time.perf_counter()
+                projected = z  # already projected
+                loss = base_model.compute_loss(projected, labels)
+            else:
+                # 原来的 token 路径（保持不变）
+                # Move to device
+                input_gene_ids = batch["gene"].to(self.device, non_blocking=True)
+                expressions = batch["expr"].to(self.device, non_blocking=True)
+                labels = batch["labels"].to(self.device, non_blocking=True)
+
+                # ---- forward time ----
+                torch.cuda.synchronize() if "cuda" in self.device else None
+                t0 = time.perf_counter()
+
+                if base_model.config.mode in ["head_only", "frozen"]:
+                    with torch.no_grad():
+                        cls_embeddings = base_model.encode_tokens(
+                            input_gene_ids, expressions, pad_token_id=self.pad_token_id
+                        )
+                else:
                     cls_embeddings = base_model.encode_tokens(
                         input_gene_ids, expressions, pad_token_id=self.pad_token_id
                     )
-            else:
-                cls_embeddings = base_model.encode_tokens(
-                    input_gene_ids, expressions, pad_token_id=self.pad_token_id
-                )
 
-            projected = base_model.retrieval_head(cls_embeddings)
+                projected = base_model.retrieval_head(cls_embeddings)
+                loss = base_model.compute_loss(projected, labels)
 
-            self.optimizer.zero_grad()
-            loss = base_model.compute_loss(projected, labels)
+            torch.cuda.synchronize() if "cuda" in self.device else None
+            t1 = time.perf_counter()
+            t_fwd += (t1 - t0)
+
+            # ---- backward/step time ----
+            torch.cuda.synchronize() if "cuda" in self.device else None
+            t2 = time.perf_counter()
+
+            self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
             self.optimizer.step()
 
             if self.scheduler is not None:
                 self.scheduler.step()
 
-            total_loss += loss.item()
+            torch.cuda.synchronize() if "cuda" in self.device else None
+            t3 = time.perf_counter()
+            t_bwd += (t3 - t2)
+
+            total_loss += float(loss.item())
             num_batches += 1
 
+            # update prev_end for next iteration timing
+            prev_end = time.perf_counter()
+
+            # ---- optional periodic logging ----
+            if self.is_master and step in (0, 10, 50, 100):
+                if "z" in batch:
+                    print(f"[Time] step={step} data=... fwd=... bwd=... (cached_z)")
+                else:
+                            # effective tokens & pad ratio for this batch
+                    tok = input_gene_ids.numel()
+                    nonpad = input_gene_ids.ne(self.pad_token_id).sum().item()
+                    pad_ratio = 1 - (nonpad / max(tok, 1))
+                    print(
+                        f"[Time] step={step} "
+                        f"data={t_data/num_batches:.4f}s "
+                        f"fwd={t_fwd/num_batches:.4f}s "
+                        f"bwd={t_bwd/num_batches:.4f}s "
+                        f"pad_ratio={pad_ratio:.2%}"
+                    )
+
         if dist.is_initialized():
-            stats = torch.tensor([total_loss, num_batches], device=self.device)
+            stats = torch.tensor([total_loss, num_batches, t_data, t_fwd, t_bwd], device=self.device)
             dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-            total_loss, num_batches = stats.tolist()
+            total_loss, num_batches, t_data, t_fwd, t_bwd = stats.tolist()
+
+        # ---- epoch summary ----
+        if self.is_master:
+            denom = max(num_batches, 1)
+            print(
+                f"[EpochTiming] avg_per_step: data={t_data/denom:.4f}s "
+                f"fwd={t_fwd/denom:.4f}s bwd={t_bwd/denom:.4f}s "
+                f"(total={ (t_data+t_fwd+t_bwd)/denom:.4f}s)"
+            )
 
         return total_loss / max(num_batches, 1)
 
@@ -575,7 +719,8 @@ class ScGPTTrainer:
             if self.is_master:
                 print("[Trainer] Skip training because optimizer is None.")
             return self.history
-
+        print("len(train_loader):", len(train_loader))
+        print("self.config.batch_size:", self.config.batch_size)
         total_steps = len(train_loader) * self.config.epochs
         self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
             self.optimizer,
@@ -592,8 +737,6 @@ class ScGPTTrainer:
             print(f"Batch size: {self.config.batch_size}")
             print(f"Learning rate: {self.config.learning_rate}")
             print("=" * 60 + "\n")
-
-        from tqdm import tqdm
 
         for epoch in range(self.config.epochs):
             if hasattr(train_loader.sampler, "set_epoch"):
@@ -687,20 +830,373 @@ class ScGPTTrainer:
 
 
 @torch.no_grad()
-def eval_accuracy(model, dataloader, device, pad_token_id):
+def _encode_projected_embeddings(model, dataloader, device, pad_token_id):
+    """
+    Encode a dataloader into projected retrieval embeddings (z) + int labels.
+
+    Returns:
+        z: (N, D) float32 numpy
+        y: (N,) int64 numpy
+    """
     model.eval()
     base = model.module if hasattr(model, "module") else model
-    correct, total = 0, 0
+
+    zs = []
+    ys = []
     for batch in dataloader:
         gene = batch["gene"].to(device)
         expr = batch["expr"].to(device)
         labels = batch["labels"].to(device)
+
         cls = base.encode_tokens(gene, expr, pad_token_id=pad_token_id, normalize=False)
-        z = base.retrieval_head(cls)
-        pred = base.loss_fn.predict(z)
-        correct += (pred == labels).sum().item()
-        total += labels.numel()
-    return correct / max(total, 1)
+        z = base.retrieval_head(cls)  # (B, D)
+        # ensure normalized for cosine
+        z = F.normalize(z, p=2, dim=-1)
+
+        zs.append(z.detach().cpu())
+        ys.append(labels.detach().cpu())
+
+    z_all = torch.cat(zs, dim=0).float().numpy() if zs else np.zeros((0, 1), dtype=np.float32)
+    y_all = torch.cat(ys, dim=0).long().numpy() if ys else np.zeros((0,), dtype=np.int64)
+    return z_all, y_all
+
+
+def _build_prototype_library(
+    z_train: np.ndarray,
+    y_train: np.ndarray,
+    label2cond: Dict[int, str],
+    library_type: str = "mean",
+    n_prototypes: int = 30,
+    m_samples: int = 50,
+    seed: int = 42,
+):
+    """
+    Build class prototypes in embedding space.
+
+    Returns:
+        proto_vecs: (M, D)
+        proto_labels: list[str] length M (condition string per prototype)
+        candidate_conditions: sorted unique condition strings
+    """
+    if z_train.size == 0:
+        return np.zeros((0, 1), dtype=np.float32), [], []
+
+    rng = np.random.default_rng(seed)
+    by_label = defaultdict(list)
+    for z, y in zip(z_train, y_train):
+        by_label[int(y)].append(z)
+
+    proto_vecs = []
+    proto_labels = []
+
+    for lab, vecs in by_label.items():
+        cond = label2cond.get(int(lab), str(lab))
+        X = np.stack(vecs, axis=0)  # (n, d)
+
+        if library_type == "mean":
+            p = X.mean(axis=0)
+            proto_vecs.append(p)
+            proto_labels.append(cond)
+        elif library_type == "bootstrap":
+            n = X.shape[0]
+            sample_size = min(m_samples, n) if m_samples and m_samples > 0 else n
+            for _ in range(n_prototypes):
+                idx = rng.choice(n, size=sample_size, replace=True)
+                p = X[idx].mean(axis=0)
+                proto_vecs.append(p)
+                proto_labels.append(cond)
+        else:
+            raise ValueError(f"Unknown library_type: {library_type}")
+
+    proto_vecs = np.stack(proto_vecs, axis=0).astype(np.float32) if proto_vecs else np.zeros((0, z_train.shape[1]), dtype=np.float32)
+
+    # normalize prototypes for cosine
+    norms = np.linalg.norm(proto_vecs, axis=1, keepdims=True)
+    proto_vecs = proto_vecs / np.maximum(norms, 1e-8)
+
+    candidate_conditions = sorted(set(proto_labels))
+    return proto_vecs, proto_labels, candidate_conditions
+
+
+def _retrieve_topk(
+    z_query: np.ndarray,
+    proto_vecs: np.ndarray,
+    proto_labels: List[str],
+    candidate_conditions: List[str],
+    top_k: List[int],
+):
+    """
+    Retrieve top-K condition predictions for each query using max aggregation across prototypes.
+    (Matches the 'prototype max' idea used in cell_eval.) :contentReference[oaicite:11]{index=11}
+
+    Returns:
+        predictions: List[List[str]] length N
+        all_scores: np.ndarray shape (N, C) scores per condition (after max aggregation)
+    """
+    if z_query.size == 0 or proto_vecs.size == 0:
+        return [], np.zeros((0, 0), dtype=np.float32)
+
+    # map condition -> indices of prototypes
+    cond_to_proto_idx = defaultdict(list)
+    for i, c in enumerate(proto_labels):
+        cond_to_proto_idx[c].append(i)
+
+    cond_list = candidate_conditions
+    cond_to_idx = {c: i for i, c in enumerate(cond_list)}
+
+    # cosine scores to each prototype
+    # z_query: (N, D), proto_vecs: (M, D)
+    sim_proto = z_query @ proto_vecs.T  # (N, M)
+
+    # aggregate to condition scores by max over prototypes
+    scores = np.full((z_query.shape[0], len(cond_list)), -np.inf, dtype=np.float32)
+    for cond, idxs in cond_to_proto_idx.items():
+        j = cond_to_idx[cond]
+        scores[:, j] = np.max(sim_proto[:, idxs], axis=1)
+
+    max_k = max(top_k)
+    top_idx = np.argsort(scores, axis=1)[:, ::-1][:, :max_k]
+    predictions = [[cond_list[i] for i in row] for row in top_idx]
+    return predictions, scores
+
+
+def _labels_to_conditions(y: np.ndarray, label2cond: Dict[int, str]) -> List[str]:
+    return [label2cond.get(int(v), str(int(v))) for v in y.tolist()]
+
+
+def save_eval_artifacts(
+    *,
+    output_dir: Path,
+    split_name: str,
+    config: dict,
+    metrics: dict,
+    details: dict,
+):
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    metrics_path = output_dir / f"eval_{split_name}_metrics.json"
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        json.dump({"config": config, "metrics": metrics}, f, indent=2, ensure_ascii=False)
+
+    details_path = output_dir / f"eval_{split_name}_details.json"
+    with open(details_path, "w", encoding="utf-8") as f:
+        json.dump(details, f, indent=2, ensure_ascii=False)
+
+    # lightweight markdown report (human-readable)
+    # key metrics (aligned with metrics.py + report.py table intent) :contentReference[oaicite:12]{index=12} :contentReference[oaicite:13]{index=13}
+    key_fields = [
+        "exact_hit@1", "exact_hit@5",
+        "relevant_hit@1", "relevant_hit@5",
+        "mrr", "ndcg@5",
+        "macro_hit@1", "macro_hit@5",
+        "n_queries", "n_in_pool", "n_conditions",
+    ]
+    lines = []
+    lines.append(f"# scGPT Finetune Evaluation Report ({split_name})")
+    lines.append("")
+    lines.append(f"- Generated at: {datetime.now().isoformat(timespec='seconds')}")
+    lines.append("")
+    lines.append("## Key Metrics")
+    lines.append("")
+    for k in key_fields:
+        if k in metrics:
+            v = metrics[k]
+            if isinstance(v, float):
+                lines.append(f"- **{k}**: {v:.6f}")
+            else:
+                lines.append(f"- **{k}**: {v}")
+    lines.append("")
+
+    # confidence summary
+    if "confidence_auc" in metrics:
+        lines.append("## Confidence")
+        lines.append("")
+        lines.append(f"- **confidence_auc**: {metrics['confidence_auc']:.6f}")
+        lines.append("")
+
+    # error analysis
+    if "error_analysis" in metrics:
+        ea = metrics["error_analysis"]
+        lines.append("## Error Analysis")
+        lines.append("")
+        lines.append(f"- overall_accuracy(top1): {ea.get('overall_accuracy', 0.0):.6f}")
+        lines.append(f"- n_queries: {ea.get('n_queries', 0)}")
+        lines.append("")
+        lines.append("### Most Confused Pairs")
+        for p in ea.get("confused_pairs", [])[:10]:
+            lines.append(f"- true={p['true']} pred={p['predicted']} count={p['count']}")
+        lines.append("")
+        lines.append("### Hardest Conditions (Hit@1)")
+        for h in ea.get("hardest_conditions", [])[:10]:
+            lines.append(f"- {h['condition']}: acc={h['accuracy']:.6f} (n={h['n_queries']})")
+        lines.append("")
+
+    report_path = output_dir / f"eval_{split_name}_report.md"
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    return metrics_path, details_path, report_path
+
+@torch.no_grad()
+def run_full_retrieval_evaluation(
+    *,
+    model,
+    device: str,
+    pad_token_id: int,
+    train_loader: DataLoader,
+    eval_loader: DataLoader,
+    label2cond: Dict[int, str],
+    top_k: List[int],
+    output_dir: Path,
+    split_name: str,
+    config_dict: dict,
+    library_type: str = "mean",
+    n_prototypes: int = 30,
+    m_samples: int = 50,
+    seed: int = 42,
+    enable_confidence: bool = False,
+    enable_error_analysis: bool = False,
+):
+    """
+    Full evaluation with the SAME metrics as repo eval code:
+    - exact_hit@K / relevant_hit@K / mrr / ndcg@K / macro_hit@K ... :contentReference[oaicite:1]{index=1}
+
+    Branch:
+    - config.loss_fn == 'classification': rank by classifier logits (closed-set)
+    - else: prototype cosine retrieval (open-set-friendly)
+    """
+    base = model.module if hasattr(model, "module") else model
+
+    # ---------- branch A: classification logits ranking ----------
+    if getattr(base.config, "loss_fn", None) == "classification":
+        # encode queries
+        z_eval, y_eval = _encode_projected_embeddings(model, eval_loader, device, pad_token_id)
+        gt_conditions = _labels_to_conditions(y_eval, label2cond)
+
+        if z_eval.size == 0:
+            metrics = compute_all_metrics([], [], top_k_values=top_k, candidate_pool=[], include_macro=True)
+            details = {"ground_truth": gt_conditions, "predictions": [], "top_k": top_k}
+            paths = save_eval_artifacts(output_dir=output_dir, split_name=split_name, config=config_dict, metrics=metrics, details=details)
+            return metrics, paths
+
+        # classifier logits: [N, C]
+        logits = base.loss_fn.classifier(torch.from_numpy(z_eval).to(device)).detach().cpu().float().numpy()
+
+        # candidates are all training classes 0..C-1 mapped to condition string
+        num_conditions = int(base.loss_fn.num_conditions)
+        candidate_conditions = [label2cond.get(i, str(i)) for i in range(num_conditions)]
+
+        # topK
+        max_k = max(top_k)
+        top_idx = np.argsort(logits, axis=1)[:, ::-1][:, :max_k]
+        predictions = [[candidate_conditions[i] for i in row] for row in top_idx]
+
+        # metrics
+        metrics = compute_all_metrics(
+            predictions,
+            gt_conditions,
+            top_k_values=top_k,
+            candidate_pool=candidate_conditions,
+            include_macro=True,
+        )
+
+        # confidence (optional): feed scores matrix to repo scorer :contentReference[oaicite:2]{index=2}
+        if enable_confidence:
+            # 你也可以换成 softmax(prob)；margin 对 logits 同样适用
+            scorer = ConfidenceScorer(method="margin", top_k_agreement=1)
+            confidences = scorer.score_batch(logits)
+            is_correct = np.array([(preds[0] == true) for preds, true in zip(predictions, gt_conditions)], dtype=bool)
+            metrics["confidence_auc"] = compute_auc_coverage_accuracy(confidences, is_correct)
+            cov, acc = coverage_accuracy_curve(confidences, is_correct, n_points=20)
+            metrics["coverage_accuracy_curve"] = {"coverage": cov.tolist(), "accuracy": acc.tolist()}
+
+        if enable_error_analysis:
+            metrics["error_analysis"] = generate_error_report(
+                predictions=predictions,
+                ground_truth=gt_conditions,
+                k=1,
+                n_confused_pairs=10,
+                n_hardest=10,
+            )
+
+        # details: 保存 logits + softmax 概率（你想要的部分）
+        probs = np.exp(logits - logits.max(axis=1, keepdims=True))
+        probs = probs / np.clip(probs.sum(axis=1, keepdims=True), 1e-12, None)
+
+        details = {
+            "ground_truth": gt_conditions,
+            "predictions": predictions,
+            "top_k": top_k,
+            "candidate_conditions": candidate_conditions,
+            "scores_type": "classification_logits",
+            "topk_label_ids": top_idx.tolist(),
+            "topk_logits": np.take_along_axis(logits, top_idx, axis=1).tolist(),
+            "topk_probs": np.take_along_axis(probs, top_idx, axis=1).tolist(),
+        }
+
+        paths = save_eval_artifacts(
+            output_dir=output_dir,
+            split_name=split_name,
+            config=config_dict,
+            metrics=metrics,
+            details=details,
+        )
+        return metrics, paths
+
+    # ---------- branch B: prototype cosine retrieval (InfoNCE / general) ----------
+    z_train, y_train = _encode_projected_embeddings(model, train_loader, device, pad_token_id)
+    z_eval, y_eval = _encode_projected_embeddings(model, eval_loader, device, pad_token_id)
+    gt_conditions = _labels_to_conditions(y_eval, label2cond)
+
+    proto_vecs, proto_labels, candidate_conditions = _build_prototype_library(
+        z_train, y_train, label2cond,
+        library_type=library_type,
+        n_prototypes=n_prototypes,
+        m_samples=m_samples,
+        seed=seed,
+    )
+    predictions, scores = _retrieve_topk(z_eval, proto_vecs, proto_labels, candidate_conditions, top_k)
+
+    metrics = compute_all_metrics(
+        predictions,
+        gt_conditions,
+        top_k_values=top_k,
+        candidate_pool=candidate_conditions,
+        include_macro=True,
+    )
+
+    if enable_confidence and scores.size > 0:
+        scorer = ConfidenceScorer(method="margin", top_k_agreement=1)
+        confidences = scorer.score_batch(scores)
+        is_correct = np.array([(preds[0] == true) for preds, true in zip(predictions, gt_conditions)], dtype=bool)
+        metrics["confidence_auc"] = compute_auc_coverage_accuracy(confidences, is_correct)
+        cov, acc = coverage_accuracy_curve(confidences, is_correct, n_points=20)
+        metrics["coverage_accuracy_curve"] = {"coverage": cov.tolist(), "accuracy": acc.tolist()}
+
+    if enable_error_analysis and predictions:
+        metrics["error_analysis"] = generate_error_report(
+            predictions=predictions,
+            ground_truth=gt_conditions,
+            k=1,
+            n_confused_pairs=10,
+            n_hardest=10,
+        )
+
+    details = {
+        "ground_truth": gt_conditions,
+        "predictions": predictions,
+        "top_k": top_k,
+        "candidate_conditions": candidate_conditions,
+        "scores_type": "prototype_cosine",
+    }
+    paths = save_eval_artifacts(
+        output_dir=output_dir,
+        split_name=split_name,
+        config=config_dict,
+        metrics=metrics,
+        details=details,
+    )
+    return metrics, paths
 
 
 # ----------------------------
@@ -729,6 +1225,12 @@ def parse_args():
     parser.add_argument("--learning_rate", type=float, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--cache_embeddings", action="store_true",
+                    help="Precompute and cache CLS embeddings (head_only only).")
+    parser.add_argument("--emb_cache_dir", type=str, default=None,
+                    help="Where to store cached embeddings (default: checkpoint_dir/emb_cache).")
+    parser.add_argument("--max_steps", type=int, default=0, 
+                        help="If >0, limit steps per epoch for debugging.")
     parser.add_argument(
         "--mode",
         type=str,
@@ -748,6 +1250,55 @@ def parse_args():
         action="store_true",
         help="Run a quick test without full training",
     )
+    # ---- full eval args ----
+    parser.add_argument(
+        "--eval_top_k",
+        type=str,
+        default="1,5,8,10",
+        help="Comma-separated K values for retrieval metrics (default: 1,5,8,10)",
+    )
+    parser.add_argument(
+        "--eval_library",
+        type=str,
+        choices=["mean", "bootstrap"],
+        default="mean",
+        help="Prototype library type for retrieval evaluation",
+    )
+    parser.add_argument(
+        "--eval_n_prototypes",
+        type=int,
+        default=30,
+        help="Number of prototypes per class when eval_library=bootstrap",
+    )
+    parser.add_argument(
+        "--eval_m_samples",
+        type=int,
+        default=50,
+        help="Samples per prototype when eval_library=bootstrap",
+    )
+    parser.add_argument(
+        "--eval_seed",
+        type=int,
+        default=42,
+        help="Seed for bootstrap prototype sampling",
+    )
+    parser.add_argument(
+        "--eval_enable_confidence",
+        action="store_true",
+        help="Enable confidence AUC + coverage-accuracy curve",
+    )
+    parser.add_argument(
+        "--eval_enable_error_analysis",
+        action="store_true",
+        help="Enable confusion/hardest-condition report",
+    )
+    parser.add_argument(
+        "--eval_report_dir",
+        type=str,
+        default=None,
+        help="Directory to save eval reports (default: checkpoint_dir/eval_reports)",
+    )
+
     return parser.parse_args()
 
 
@@ -1020,6 +1571,54 @@ def main():
         **loader_kwargs,
     )
 
+    # ---- quick sanity check: batch size & token stats ----
+    if is_master:
+        print("\n" + "-" * 60)
+        print("[Sanity] DataLoader / batch stats")
+        print(f"  config.batch_size = {config.batch_size}")
+        print(f"  len(train_loader) = {len(train_loader)}  (steps per epoch)")
+        print(f"  len(val_loader)   = {len(val_loader)}")
+        print(f"  pad_token_id      = {pad_token_id}")
+        print("-" * 60)
+
+        # Peek a few batches to estimate padding ratio and effective tokens
+        peek_batches = 5
+        total_tokens = 0
+        total_nonpad = 0
+        seen = 0
+
+        for i, b in enumerate(train_loader):
+            gene = b["gene"]  # [B, L]
+            # total tokens in batch
+            tok = gene.numel()
+            # non-pad tokens in batch
+            nonpad = gene.ne(pad_token_id).sum().item()
+
+            total_tokens += tok
+            total_nonpad += nonpad
+            seen += 1
+
+            if i < 3:
+                # print first 3 batch shapes for confirmation
+                print(f"[Sanity] batch {i}: gene.shape={tuple(gene.shape)} "
+                      f"tokens={tok} nonpad={nonpad} pad_ratio={1 - (nonpad / max(tok,1)):.4%}")
+
+            if seen >= peek_batches:
+                break
+
+        if seen > 0:
+            avg_pad_ratio = 1 - (total_nonpad / max(total_tokens, 1))
+            avg_nonpad_per_batch = total_nonpad / seen
+            print(f"[Sanity] avg over {seen} batches: "
+                  f"avg_nonpad_tokens_per_batch={avg_nonpad_per_batch:.1f}, "
+                  f"avg_pad_ratio={avg_pad_ratio:.4%}")
+        print("-" * 60 + "\n")
+
+    # ---- parse eval args ----
+    eval_top_k = [int(x) for x in args.eval_top_k.split(",") if x.strip()]
+    eval_report_dir = Path(args.eval_report_dir) if args.eval_report_dir \
+            else Path(config.checkpoint_dir) / "eval_reports"
+
     # DDP wrap
     if ddp_enabled:
         allow_unused = config.loss_fn == "infonce" or config.mode == "lora_head"
@@ -1038,6 +1637,32 @@ def main():
         end_to_end=end_to_end_flag,
         pad_token_id=pad_token_id,
     )
+    if args.cache_embeddings:
+        if config.mode != "head_only":
+            raise ValueError("--cache_embeddings is intended for head_only mode only.")
+
+        emb_dir = Path(args.emb_cache_dir) if args.emb_cache_dir else Path(config.checkpoint_dir) / "emb_cache"
+        # 先把 backbone+head 加载到位（如果你要从某个初始 checkpoint 开始也可以）
+        # 然后缓存 train/val
+        build_embedding_cache(model=trainer.model, device=device, pad_token_id=pad_token_id,
+                            dataset=train_subset, collate_fn=collate_fn, split_name="train", out_dir=emb_dir,
+                            batch_size=config.batch_size)
+        build_embedding_cache(model=trainer.model, device=device, pad_token_id=pad_token_id,
+                            dataset=val_subset, collate_fn=collate_fn, split_name="val", out_dir=emb_dir,
+                            batch_size=config.batch_size)
+
+        # 用 embedding dataset 替换 train_loader / val_loader
+        train_z = emb_dir / "train_z.npy"
+        train_y = emb_dir / "train_y.npy"
+        val_z = emb_dir / "val_z.npy"
+        val_y = emb_dir / "val_y.npy"
+
+        train_loader = DataLoader(EmbeddingDataset(train_z, train_y), batch_size=config.batch_size,
+                                shuffle=True, num_workers=2, pin_memory=True, collate_fn=emb_collate)
+        val_loader = DataLoader(EmbeddingDataset(val_z, val_y), batch_size=config.batch_size,
+                                shuffle=False, num_workers=2, pin_memory=True, collate_fn=emb_collate)
+
+        print("[Cache] Switched training to cached embeddings. Backbone forward will be skipped.")
 
     # Eval-only / frozen
     if config.mode == "frozen" or config.eval_only:
@@ -1045,15 +1670,50 @@ def main():
             raise ValueError("frozen/eval_only requires --finetune_checkpoint to load head/LoRA weights")
         trainer.load_checkpoint(config.finetune_checkpoint)
 
+        # loaders for eval
+        train_eval_loader = DataLoader(
+            train_subset,
+            batch_size=config.batch_size,
+            shuffle=False,
+            collate_fn=collate_fn,
+        )
         test_loader = DataLoader(
             test_dataset,
             batch_size=config.batch_size,
             shuffle=False,
             collate_fn=collate_fn,
         )
-        acc_test = eval_accuracy(trainer.model, test_loader, device, pad_token_id)
 
-        acc_ood = None
+        # label -> condition string (gene name)
+        label2cond = {int(k): str(v) for k, v in label2gene.items()}
+
+        if is_master:
+            print("[Eval] Running full retrieval evaluation on TEST...")
+
+        metrics_test, paths_test = run_full_retrieval_evaluation(
+            model=trainer.model,
+            device=device,
+            pad_token_id=pad_token_id,
+            train_loader=train_eval_loader,
+            eval_loader=test_loader,
+            label2cond=label2cond,
+            top_k=eval_top_k,
+            output_dir=eval_report_dir,
+            split_name="test",
+            config_dict=asdict(config),
+            library_type=args.eval_library,
+            n_prototypes=args.eval_n_prototypes,
+            m_samples=args.eval_m_samples,
+            seed=args.eval_seed,
+            enable_confidence=args.eval_enable_confidence,
+            enable_error_analysis=args.eval_enable_error_analysis,
+        )
+
+        if is_master:
+            print(f"[Eval][TEST] exact_hit@1={metrics_test.get('exact_hit@1', 0.0):.4f}")
+            print(f"[Eval][TEST] report saved: {paths_test[-1]}")
+
+        # OOD (optional)
         if ood_dataset is not None:
             ood_loader = DataLoader(
                 ood_dataset,
@@ -1061,21 +1721,74 @@ def main():
                 shuffle=False,
                 collate_fn=collate_fn,
             )
-            acc_ood = eval_accuracy(trainer.model, ood_loader, device, pad_token_id)
+            if is_master:
+                print("[Eval] Running full retrieval evaluation on OOD...")
 
-        if is_master:
-            print(f"[Eval] test acc: {acc_test:.4f}")
-            if acc_ood is not None:
-                print(f"[Eval] ood  acc: {acc_ood:.4f}")
+            metrics_ood, paths_ood = run_full_retrieval_evaluation(
+                model=trainer.model,
+                device=device,
+                pad_token_id=pad_token_id,
+                train_loader=train_eval_loader,
+                eval_loader=ood_loader,
+                label2cond=label2cond,
+                top_k=eval_top_k,
+                output_dir=eval_report_dir,
+                split_name="ood",
+                config_dict=asdict(config),
+                library_type=args.eval_library,
+                n_prototypes=args.eval_n_prototypes,
+                m_samples=args.eval_m_samples,
+                seed=args.eval_seed,
+                enable_confidence=args.eval_enable_confidence,
+                enable_error_analysis=args.eval_enable_error_analysis,
+            )
+            if is_master:
+                print(f"[Eval][OOD] exact_hit@1={metrics_ood.get('exact_hit@1', 0.0):.4f}")
+                print(f"[Eval][OOD] report saved: {paths_ood[-1]}")
         return
+
 
     # Train
     history = trainer.train(train_loader, val_loader)
     if is_master:
-        history_path = Path(config.checkpoint_dir) / f"history_{config.mode}.json"
-        with open(history_path, "w", encoding="utf-8") as f:
-            json.dump(history, f, indent=2, ensure_ascii=False)
-        print(f"Training history saved: {history_path}")
+        # run full eval after training
+        eval_top_k = [int(x) for x in args.eval_top_k.split(",") if x.strip()]
+        eval_report_dir = Path(args.eval_report_dir) if args.eval_report_dir else Path(config.checkpoint_dir) / "eval_reports"
+
+        train_eval_loader = DataLoader(
+            train_subset,
+            batch_size=config.batch_size,
+            shuffle=False,
+            collate_fn=collate_fn,
+        )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=config.batch_size,
+            shuffle=False,
+            collate_fn=collate_fn,
+        )
+        label2cond = {int(k): str(v) for k, v in label2gene.items()}
+
+        print("[Eval] Post-train full retrieval evaluation on TEST...")
+        run_full_retrieval_evaluation(
+            model=trainer.model,
+            device=device,
+            pad_token_id=pad_token_id,
+            train_loader=train_eval_loader,
+            eval_loader=test_loader,
+            label2cond=label2cond,
+            top_k=eval_top_k,
+            output_dir=eval_report_dir,
+            split_name="test",
+            config_dict=asdict(config),
+            library_type=args.eval_library,
+            n_prototypes=args.eval_n_prototypes,
+            m_samples=args.eval_m_samples,
+            seed=args.eval_seed,
+            enable_confidence=args.eval_enable_confidence,
+            enable_error_analysis=args.eval_enable_error_analysis,
+        )
+
 
     if dist.is_initialized():
         dist.destroy_process_group()
